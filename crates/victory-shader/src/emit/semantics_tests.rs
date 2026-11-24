@@ -1908,6 +1908,149 @@ fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
 
+/// `v_perm_b32`: byte i of the result is the byte of {S0, S1} (S1 the low
+/// dword) that byte i of S2 selects: 0-7 the bytes themselves, 8-11 the
+/// sign (0x00 or 0xFF) of bytes 1 and 3 of S1, then of S0, 12 zero, 13 and
+/// up 0xFF (RDNA2 ISA).
+fn perm(a: u32, b: u32, sel: u32) -> u32 {
+    let data = u64::from(a) << 32 | u64::from(b);
+    (0..4).fold(0, |r, i| {
+        let s = sel >> (8 * i) & 0xFF;
+        let sign = |bit: u32| if data >> bit & 1 != 0 { 0xFF } else { 0 };
+        let byte = match s {
+            0..=7 => (data >> (8 * s) & 0xFF) as u32,
+            8 => sign(15),
+            9 => sign(31),
+            10 => sign(47),
+            11 => sign(63),
+            12 => 0,
+            _ => 0xFF,
+        };
+        r | byte << (8 * i)
+    })
+}
+
+fn perm_probes() -> Vec<Probe> {
+    let words = [
+        0u32,
+        0xFFFF_FFFF,
+        0x0403_0201,
+        0x80FF_7F01,
+        0x8000_8000,
+        0x7F7F_FF7F,
+        0x1234_5678,
+        0xDEAD_BEEF,
+    ];
+    let mut sels: Vec<u32> = (0..=0x10u32).map(|s| s * 0x0101_0101).collect();
+    sels.extend([
+        0x0302_0100,
+        0x0706_0504,
+        0x0001_0203,
+        0x0405_0607,
+        0x0C0D_0E0F,
+        0x0B0A_0908,
+        0x080A_090B,
+        0x0100_0F0C,
+        0x0C0C_0C0C,
+        0xFF0D_0C0B,
+        0x0908_0100,
+        0x0B0A_0504,
+    ]);
+    let mut x = 0x2545_F491u32;
+    sels.extend((0..64).map(|_| {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        // Mostly valid selectors, some of 16 and up.
+        (x & 0x0F0F_0F0F) | ((x >> 4) & 0x1010_1010)
+    }));
+    let ab = pairs(&words, &words);
+    let mut p = vec![probe(
+        vop3(0x344, 5, [v(1), v(2), v(3)], NONE),
+        sels.iter()
+            .flat_map(|&s| ab.iter().map(move |i| [i[0], i[1], s, OLD]))
+            .collect(),
+        INT,
+        |i| vec![perm(i[0], i[1], i[2])],
+    )];
+    // The same with the selector a literal in the instruction.
+    for &s in &sels[..sels.len() - 64] {
+        let mut body = vop3(0x344, 5, [v(1), v(2), 255], NONE).to_vec();
+        body.push(s);
+        p.push(probe(body, ab.clone(), INT, move |i| {
+            vec![perm(i[0], i[1], s)]
+        }));
+    }
+    p
+}
+
+#[test]
+fn perm_matches_the_hardware() {
+    assert_clean(check(&perm_probes()));
+}
+
+/// `v_mad_u64_u32` and `v_mad_i64_i32`: the 32 by 32 bit product plus a
+/// 64-bit addend in S2 (wrapping), the unsigned form's carry out of the
+/// 64-bit addition in VCC (RDNA2 ISA). The signed form's carry is not
+/// read.
+#[test]
+fn mad64_matches_the_hardware() {
+    let lows = [0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678];
+    let highs = [0u32, 1, 0x7FFF_FFFF, 0xFFFF_FFFF, 0x8000_0000];
+    let inputs: Vec<[u32; 4]> = pairs(U32_EDGES, U32_EDGES)
+        .iter()
+        .flat_map(|i| {
+            lows.iter()
+                .flat_map(move |&lo| highs.iter().map(move |&hi| [i[0], i[1], lo, hi]))
+        })
+        .collect();
+    // The product to v6:v7, the carry mask to v5.
+    let mut unsigned = vop3b(0x176, 6, 106, [v(1), v(2), v(3)], false).to_vec();
+    unsigned.extend(vop3(0x101, 5, [int(0), int(1), VCC], NONE));
+    let signed = vop3b(0x177, 6, 106, [v(1), v(2), v(3)], false);
+    let addend = |i: [u32; 4]| u64::from(i[3]) << 32 | u64::from(i[2]);
+    assert_clean(check(&[
+        probe(unsigned, inputs.clone(), INT, move |i| {
+            let p = u64::from(i[0]) * u64::from(i[1]);
+            let (r, carry) = p.overflowing_add(addend(i));
+            vec![u32::from(carry), r as u32, (r >> 32) as u32]
+        }),
+        probe(signed, inputs, INT, move |i| {
+            let p = i64::from(i[0] as i32) * i64::from(i[1] as i32);
+            let r = (p as u64).wrapping_add(addend(i));
+            // v5 still holds d, the addend's high half.
+            vec![i[3], r as u32, (r >> 32) as u32]
+        }),
+    ]));
+}
+
+/// `v_min3` and `v_max3` of signed and unsigned integers.
+#[test]
+fn min3_max3_integers_match_the_hardware() {
+    let thirds = [0u32, 1, 0xFFFF_FFFF, 0x8000_0000, 0x7FFF_FFFF, 0x1234_5678];
+    let abc = triples(U32_EDGES, U32_EDGES, &thirds);
+    let ops: [(u16, fn(u32, u32, u32) -> u32); 4] = [
+        (0x152, |a, b, c| {
+            (a as i32).min(b as i32).min(c as i32) as u32
+        }),
+        (0x153, |a, b, c| a.min(b).min(c)),
+        (0x155, |a, b, c| {
+            (a as i32).max(b as i32).max(c as i32) as u32
+        }),
+        (0x156, |a, b, c| a.max(b).max(c)),
+    ];
+    let probes: Vec<Probe> = ops
+        .into_iter()
+        .map(|(op, f)| {
+            probe(
+                vop3(op, 5, [v(1), v(2), v(3)], NONE),
+                abc.clone(),
+                INT,
+                move |i| vec![f(i[0], i[1], i[2])],
+            )
+        })
+        .collect();
+    assert_clean(check(&probes));
+}
+
 /// Carries as lane masks: `v_add_co_u32` into VCC, `v_add_co_ci_u32`
 /// taking and giving VCC, the last carry read back by `v_cndmask_b32`.
 #[test]
