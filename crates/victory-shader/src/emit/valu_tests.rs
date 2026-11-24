@@ -715,6 +715,100 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_cvt_i32_and_u32_f32_truncate_saturate_and_take_nan_as_zero() {
+    // RDNA2: toward zero, out-of-range values (infinities too) saturate, NaN
+    // gives 0 – what Rust's `as` does.
+    let f = f32::to_bits;
+    let inputs = [
+        0,
+        0x8000_0000, // -0
+        f(1.5),
+        f(-1.5),
+        f(-0.75),
+        f(0.999_999_94),
+        f(16_777_215.0),
+        f(2_147_483_520.0), // largest f32 below 2^31
+        f(2_147_483_648.0), // 2^31
+        f(-2_147_483_648.0),
+        f(-2_147_483_904.0), // next f32 below -2^31
+        f(4_294_967_040.0),  // largest f32 below 2^32
+        f(4_294_967_296.0),  // 2^32
+        f(1e30),
+        f(-1e30),
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x7FC0_0000, // NaN
+        0xFFC0_0000, // -NaN
+        0x7F80_0001, // signalling NaN
+        0x0000_0001, // smallest denormal
+    ];
+    let ops: [(u16, &str, fn(f32) -> u32); 2] = [
+        (0x008, "v_cvt_i32_f32", |x| x as i32 as u32),
+        (0x007, "v_cvt_u32_f32", |x| x as u32),
+    ];
+    let cases: Vec<[u32; 4]> = inputs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    for (op, name, want) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let x = f32::from_bits(inp[0]);
+            let want = want(x);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x} = {x:?}) = {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cvt_f32_i32_u32_and_ubyte_round_to_nearest_even() {
+    // Integers past 2^24 round to nearest even (the MODE default), as Rust's
+    // `as` does; the ubyte forms convert one byte of the source.
+    let inputs = [
+        0,
+        1,
+        0xFF,
+        0x0100_0001, // 2^24 + 1: tie, rounds down to even
+        0x0100_0003, // 2^24 + 3: tie, rounds up to even
+        0x0100_0005,
+        0x7FFF_FFBF, // just below the halfway point to 2^31
+        0x7FFF_FFC0, // halfway, rounds to 2^31
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0x8000_0001,
+        0xFFFF_FF7F,
+        0xFFFF_FF80, // u32: halfway, rounds to 2^32
+        0xFFFF_FFFF,
+        0x80FF_7F01,
+        0x12AB_00FE,
+    ];
+    let ops: [(u16, &str, fn(u32) -> f32); 6] = [
+        (0x005, "v_cvt_f32_i32", |x| x as i32 as f32),
+        (0x006, "v_cvt_f32_u32", |x| x as f32),
+        (0x011, "v_cvt_f32_ubyte0", |x| f32::from(x as u8)),
+        (0x012, "v_cvt_f32_ubyte1", |x| f32::from((x >> 8) as u8)),
+        (0x013, "v_cvt_f32_ubyte2", |x| f32::from((x >> 16) as u8)),
+        (0x014, "v_cvt_f32_ubyte3", |x| f32::from((x >> 24) as u8)),
+    ];
+    let cases: Vec<[u32; 4]> = inputs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    for (op, name, want) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = want(inp[0]).to_bits();
+            assert_eq!(
+                got,
+                want,
+                "{backend}: {name}({:#010x}) = {got:#010x} ({:?}), want {want:#010x} ({:?})",
+                inp[0],
+                f32::from_bits(got),
+                f32::from_bits(want),
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
