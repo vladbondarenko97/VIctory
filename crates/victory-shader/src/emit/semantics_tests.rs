@@ -1630,10 +1630,9 @@ fn rounding_matches_the_hardware() {
 /// |y| >= |x|, else x, so ties go to z, then y; a negative axis is `< 0`,
 /// which -0 is not. The face is 0..5 (+x, -x, +y, -y, +z, -z), the other
 /// results are the face's s and t numerators and twice the major axis.
-/// Denormals read and write as zeros. NaN is left out: no public source
-/// says which axis it picks.
+/// NaN and denormals are left out: no public source says which axis a NaN
+/// picks, or whether a denormal is flushed on the way in or out.
 fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
-    let (x, y, z) = (ftz(x), ftz(y), ftz(z));
     let (ax, ay, az) = (fl(x).abs(), fl(y).abs(), fl(z).abs());
     let neg = |v: u32| fl(v) < 0.0;
     let flip = |v: u32| v ^ 0x8000_0000;
@@ -1644,7 +1643,7 @@ fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
     } else {
         0
     };
-    let r = match (op, axis) {
+    match (op, axis) {
         (0x144, 2) => (if neg(z) { 5.0f32 } else { 4.0 }).to_bits(),
         (0x144, 1) => (if neg(y) { 3.0f32 } else { 2.0 }).to_bits(),
         (0x144, _) => (if neg(x) { 1.0f32 } else { 0.0 }).to_bits(),
@@ -1674,16 +1673,15 @@ fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
         (_, 2) => (fl(z) * 2.0).to_bits(),
         (_, 1) => (fl(y) * 2.0).to_bits(),
         _ => (fl(x) * 2.0).to_bits(),
-    };
-    ftz(r)
+    }
 }
 
 fn cube_probes() -> Vec<Probe> {
-    // Every sign, zero, tie and magnitude order of three axes; no NaN.
+    // Every sign, zero, tie and magnitude order of three axes.
     let axes: Vec<u32> = F32_EDGES
         .iter()
         .copied()
-        .filter(|&x| !nan(x))
+        .filter(|&x| !nan(x) && (x & 0x7F80_0000 != 0 || x & 0x7F_FFFF == 0))
         .chain([0x4000_0000, 0xC040_0000, 0x3F80_0000 | 1])
         .collect();
     let dirs = triples(&axes, &axes, &axes);
