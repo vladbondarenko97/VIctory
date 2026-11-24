@@ -1367,6 +1367,8 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
     };
+    // Write-combine and no-cache do not change what a write needs.
+    const CACHE_BITS: u32 = 0x200 | 0x400; // PAGE_NOCACHE | PAGE_WRITECOMBINE
     let end = dst as usize + len;
     let mut at = dst as usize;
     while at < end {
@@ -1381,14 +1383,42 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         };
         let to = region_end.clamp(at + 1, end);
         let from = src.wrapping_add(at - dst as usize);
-        if n != 0 && info.State == MEM_COMMIT && matches!(info.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+        if n != 0
+            && info.State == MEM_COMMIT
+            && matches!(info.Protect & !CACHE_BITS, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+        {
             // SAFETY: committed read-write memory (checked just now) of at
             // least `to - at` bytes; the source is our mapped host copy.
             unsafe { std::ptr::copy_nonoverlapping(from, at as *mut u8, to - at) };
+            WRITTEN_DIRECT.fetch_add(to - at, Ordering::Relaxed);
         } else {
+            if n != 0 {
+                note_fallback(&info);
+            }
             write_process(at as *mut u8, from, to - at);
         }
         at = to;
+    }
+}
+
+/// Bytes [`write_mapped`] copied directly (a test reads it).
+static WRITTEN_DIRECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Logs each (state, protection, type) that [`write_mapped`] leaves to the
+/// kernel, the first time it is seen.
+fn note_fallback(info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION) {
+    static SEEN: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+    let key = (info.State, info.Protect, info.Type);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        seen.push(key);
+        tracing::info!(
+            state = format_args!("{:#x}", key.0),
+            protect = format_args!("{:#x}", key.1),
+            kind = format_args!("{:#x}", key.2),
+            region = format_args!("{:#x}+{:#x}", info.BaseAddress as usize, info.RegionSize),
+            "copy back: not direct, written through the kernel"
+        );
     }
 }
 
@@ -2096,6 +2126,7 @@ mod write_mapped_tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
         VirtualFree, VirtualProtect,
     };
+    use std::sync::atomic::Ordering;
 
     /// Read-write pages around a no-access page and a read-only one (both
     /// left to the kernel, as before): the read-write pages land and the
@@ -2113,7 +2144,12 @@ mod write_mapped_tests {
             VirtualProtect(base.add(3 * P).cast(), P, PAGE_READONLY, &mut old);
         }
         let src = vec![0xabu8; 5 * P];
+        // Page 4 is write-combined: still copied directly.
+        // SAFETY: protection of our own page.
+        unsafe { VirtualProtect(base.add(4 * P).cast(), P, PAGE_READWRITE | 0x400, &mut old) };
+        let direct = super::WRITTEN_DIRECT.load(Ordering::Relaxed);
         super::write_mapped(base, src.as_ptr(), 5 * P);
+        assert_eq!(super::WRITTEN_DIRECT.load(Ordering::Relaxed) - direct, 2 * P + P, "pages 0, 2 and 4 directly");
         // SAFETY: back to read-write to look at every page.
         unsafe {
             VirtualProtect(base.add(P).cast(), P, PAGE_READWRITE, &mut old);
