@@ -1357,7 +1357,43 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// Committed read-write memory is copied directly: `WriteProcessMemory`
+/// costs about 4.5 us per MB of the destination's whole allocation per call
+/// (~1.1 ms in a 256 MB heap, whatever the length), which made the world's
+/// ~430 pieces per frame cost ~0.5 s. Anything else (unmapped, guarded,
+/// read-only) goes through the kernel as before.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+    };
+    let end = dst as usize + len;
+    let mut at = dst as usize;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let region_end = if n == 0 {
+            end
+        } else {
+            (info.BaseAddress as usize).saturating_add(info.RegionSize)
+        };
+        let to = region_end.clamp(at + 1, end);
+        let from = src.wrapping_add(at - dst as usize);
+        if n != 0 && info.State == MEM_COMMIT && matches!(info.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+            // SAFETY: committed read-write memory (checked just now) of at
+            // least `to - at` bytes; the source is our mapped host copy.
+            unsafe { std::ptr::copy_nonoverlapping(from, at as *mut u8, to - at) };
+        } else {
+            write_process(at as *mut u8, from, to - at);
+        }
+        at = to;
+    }
+}
+
+/// [`write_mapped`] through the kernel, which checks the destination.
+fn write_process(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
@@ -2051,5 +2087,44 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod write_mapped_tests {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree, VirtualProtect,
+    };
+
+    /// Read-write pages around a no-access page and a read-only one (both
+    /// left to the kernel, as before): the read-write pages land and the
+    /// no-access page keeps its zeros.
+    #[test]
+    fn write_mapped_skips_unmapped_pages_and_copies_the_rest() {
+        const P: usize = 4096;
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 5 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: protections of our own pages.
+        unsafe {
+            VirtualProtect(base.add(P).cast(), P, PAGE_NOACCESS, &mut old);
+            VirtualProtect(base.add(3 * P).cast(), P, PAGE_READONLY, &mut old);
+        }
+        let src = vec![0xabu8; 5 * P];
+        super::write_mapped(base, src.as_ptr(), 5 * P);
+        // SAFETY: back to read-write to look at every page.
+        unsafe {
+            VirtualProtect(base.add(P).cast(), P, PAGE_READWRITE, &mut old);
+            VirtualProtect(base.add(3 * P).cast(), P, PAGE_READWRITE, &mut old);
+        }
+        // SAFETY: committed read-write, ours.
+        let got = unsafe { std::slice::from_raw_parts(base, 5 * P) };
+        let filled = |page: usize| got[page * P..(page + 1) * P].iter().all(|&b| b == 0xab);
+        assert!(filled(0) && filled(2) && filled(4), "read-write pages written");
+        assert!(got[P..2 * P].iter().all(|&b| b == 0), "no-access page was left alone");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }
