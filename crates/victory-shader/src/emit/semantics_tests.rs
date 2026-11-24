@@ -2211,6 +2211,88 @@ fn sixteen_bit_floats_match_the_hardware() {
     assert_clean(check(&passing(sixteen_bit_probes())));
 }
 
+/// An f16 result in the low half of v5, the high half of the old v5 (d)
+/// kept: the rounding functions on f16 operands (denormals kept, so a
+/// negative denormal floors to -1 and ceils to -0), the fraction (never
+/// 1.0, a zero result positive, infinity NaN, as for f32), the integer to
+/// f16 conversions (rounded to nearest even, 65520 and up infinity) and
+/// the normalised conversions (clamped, times 32767 or 65535, to the
+/// nearest integer; no f16 times those lands on a tie, NaN gives 0).
+fn f16_rounding_probes() -> Vec<Probe> {
+    let high = |n: usize| [0xABCD, 0x3C00, 0x7E00, 0x8000][n % 4];
+    let halves: Vec<[u32; 4]> = F16_EDGES
+        .iter()
+        .copied()
+        // Every f16 near the integers and the unit interval, both signs.
+        .chain((0..0x1000u32).map(|n| (n * 5 + 0x2C00) & 0xFFFF))
+        .chain((0..0x400u32).map(|n| (n << 1) | 0x8000))
+        .enumerate()
+        .map(|(n, x)| [x | (high(n) << 16), 0, 0, 0x5A5A_3C00])
+        .collect();
+    let keep = |i: [u32; 4], r: u32| vec![i[3] & 0xFFFF_0000 | r];
+    let round = |op: u16, f: fn(f64) -> f64| {
+        probe([vop1(op, 5, v(1))], halves.clone(), F16, move |i| {
+            keep(i, to_f16(f(h(i[0])), false))
+        })
+    };
+    let fract = |x: f64| {
+        let r = to_f16(x - x.floor(), false);
+        if x.is_infinite() {
+            0xFE00
+        } else if r == 0x3C00 {
+            0x3BFF
+        } else {
+            r & 0x7FFF
+        }
+    };
+    let ints: Vec<[u32; 4]> = [
+        0u32, 1, 2, 0x7FF, 0x800, 0x801, 0x802, 0x803, 0xFFF, 0x1000, 0x1001, 0x1003, 0x1005,
+        0x7FFF, 0x8000, 0x8001, 0xFFE0, 0xFFEF, 0xFFF0, 0xFFF7, 0xFFFF, 0xFF00, 0x1234, 0xDEAD,
+    ]
+    .iter()
+    .enumerate()
+    .map(|(n, &x)| [x | (high(n) << 16), 0, 0, 0x5A5A_3C00])
+    .collect();
+    let norm = |x: u32, signed: bool| {
+        let f = h(x);
+        if f.is_nan() {
+            return 0;
+        }
+        let (lo, scale) = if signed {
+            (-1.0, 32767.0)
+        } else {
+            (0.0, 65535.0)
+        };
+        round_even(f.clamp(lo, 1.0) * scale) as i64 as u32 & 0xFFFF
+    };
+    vec![
+        round(0x5B, f64::floor),
+        round(0x5C, f64::ceil),
+        round(0x5D, f64::trunc),
+        round(0x5E, f64::round_ties_even),
+        probe([vop1(0x5F, 5, v(1))], halves.clone(), F16, move |i| {
+            keep(i, fract(h(i[0])))
+        }),
+        probe([vop1(0x50, 5, v(1))], ints.clone(), F16, move |i| {
+            keep(i, to_f16(f64::from(i[0] & 0xFFFF), false))
+        }),
+        probe([vop1(0x51, 5, v(1))], ints, F16, move |i| {
+            keep(i, to_f16(f64::from(i[0] as u16 as i16), false))
+        }),
+        probe([vop1(0x63, 5, v(1))], halves.clone(), INT, move |i| {
+            keep(i, norm(i[0], true))
+        }),
+        probe([vop1(0x64, 5, v(1))], halves, INT, move |i| {
+            keep(i, norm(i[0], false))
+        }),
+    ]
+}
+
+#[test]
+fn f16_rounding_and_normalised_conversions_match_the_hardware() {
+    assert_clean(check(&f16_rounding_probes()));
+}
+
 /// `v_fma_mix*`: each source an f32 (a denormal read as zero, measured on
 /// RDNA2 by the Leonida project) or, with `op_sel_hi`, the f16 half
 /// `op_sel` names; `neg_hi` is the absolute value; fused (RDNA2 ISA).
