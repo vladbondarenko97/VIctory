@@ -1387,19 +1387,32 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             && info.State == MEM_COMMIT
             && matches!(info.Protect & !CACHE_BITS, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
         {
+            let t = std::time::Instant::now();
             // SAFETY: committed read-write memory (checked just now) of at
             // least `to - at` bytes; the source is our mapped host copy.
             unsafe { std::ptr::copy_nonoverlapping(from, at as *mut u8, to - at) };
             WRITTEN_DIRECT.fetch_add(to - at, Ordering::Relaxed);
+            WM[0].fetch_add((to - at) as u64, Ordering::Relaxed);
+            WM[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         } else {
             if n != 0 {
                 note_fallback(&info);
+            } else {
+                WM[4].fetch_add(1, Ordering::Relaxed);
             }
+            let t = std::time::Instant::now();
             write_process(at as *mut u8, from, to - at);
+            WM[2].fetch_add((to - at) as u64, Ordering::Relaxed);
+            WM[3].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        WM[5].fetch_add(1, Ordering::Relaxed);
         at = to;
     }
 }
+
+/// Profiling: `write_mapped` bytes and us direct, bytes and us through the
+/// kernel, VirtualQuery failures, regions queried.
+pub(crate) static WM: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Bytes [`write_mapped`] copied directly (a test reads it).
 static WRITTEN_DIRECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1602,6 +1615,8 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             {
+                let w = WM.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!("write_mapped per frame: direct {:.2} MB {:.1} ms; kernel {:.2} MB {:.1} ms; query failures {:.1}, regions {:.1}", w[0] / 1e6, w[1] / 1e3, w[2] / 1e6, w[3] / 1e3, w[4], w[5]);
                 let v = crate::shadow::CB_PARTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!("copy back per frame: {:.1} ms (read {:.1}, write {:.1}, watch {:.1}); scanned {:.1} MB, differing {:.1} MB", v[0] / 1e3, v[1] / 1e3, v[2] / 1e3, v[3] / 1e3, v[4] / 1e6, v[5] / 1e6);
             }
