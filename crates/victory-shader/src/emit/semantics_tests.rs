@@ -1625,6 +1625,107 @@ fn rounding_matches_the_hardware() {
     assert_clean(check(&rounding_probes()));
 }
 
+/// `v_cubeid/sc/tc/ma_f32` of a direction (x, y, z) in S0, S1, S2 (RDNA2
+/// ISA): z is the major axis when |z| >= |x| and |z| >= |y|, else y when
+/// |y| >= |x|, else x, so ties go to z, then y; a negative axis is `< 0`,
+/// which -0 is not. The face is 0..5 (+x, -x, +y, -y, +z, -z), the other
+/// results are the face's s and t numerators and twice the major axis.
+/// Denormals read and write as zeros. NaN is left out: no public source
+/// says which axis it picks.
+fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
+    let (x, y, z) = (ftz(x), ftz(y), ftz(z));
+    let (ax, ay, az) = (fl(x).abs(), fl(y).abs(), fl(z).abs());
+    let neg = |v: u32| fl(v) < 0.0;
+    let flip = |v: u32| v ^ 0x8000_0000;
+    let axis = if az >= ax && az >= ay {
+        2
+    } else if ay >= ax {
+        1
+    } else {
+        0
+    };
+    let r = match (op, axis) {
+        (0x144, 2) => (if neg(z) { 5.0f32 } else { 4.0 }).to_bits(),
+        (0x144, 1) => (if neg(y) { 3.0f32 } else { 2.0 }).to_bits(),
+        (0x144, _) => (if neg(x) { 1.0f32 } else { 0.0 }).to_bits(),
+        (0x145, 2) => {
+            if neg(z) {
+                flip(x)
+            } else {
+                x
+            }
+        }
+        (0x145, 1) => x,
+        (0x145, _) => {
+            if neg(x) {
+                z
+            } else {
+                flip(z)
+            }
+        }
+        (0x146, 2 | 0) => flip(y),
+        (0x146, _) => {
+            if neg(y) {
+                flip(z)
+            } else {
+                z
+            }
+        }
+        (_, 2) => (fl(z) * 2.0).to_bits(),
+        (_, 1) => (fl(y) * 2.0).to_bits(),
+        _ => (fl(x) * 2.0).to_bits(),
+    };
+    ftz(r)
+}
+
+fn cube_probes() -> Vec<Probe> {
+    // Every sign, zero, tie and magnitude order of three axes; no NaN.
+    let axes: Vec<u32> = F32_EDGES
+        .iter()
+        .copied()
+        .filter(|&x| !nan(x))
+        .chain([0x4000_0000, 0xC040_0000, 0x3F80_0000 | 1])
+        .collect();
+    let dirs = triples(&axes, &axes, &axes);
+    let mods = [
+        NONE,
+        M { abs: 7, ..NONE },
+        M { neg: 7, ..NONE },
+        M { neg: 1, ..NONE },
+        M {
+            neg: 4,
+            abs: 2,
+            ..NONE
+        },
+    ];
+    let mut p = Vec::new();
+    for op in [0x144u16, 0x145, 0x146, 0x147] {
+        for m in mods {
+            let inputs = if m.abs == 0 && m.neg == 0 {
+                dirs.clone()
+            } else {
+                // The modifiers: a spread of the directions is enough.
+                dirs.iter().step_by(7).copied().collect()
+            };
+            p.push(probe(
+                vop3(op, 5, [v(1), v(2), v(3)], m),
+                inputs,
+                F32,
+                move |i| {
+                    let s = |k: usize| mods_in(i[k], k, m);
+                    vec![cube(op, s(0), s(1), s(2))]
+                },
+            ));
+        }
+    }
+    p
+}
+
+#[test]
+fn cube_face_coordinates_match_the_hardware() {
+    assert_clean(check(&cube_probes()));
+}
+
 /// The transcendental instructions' results: denormals in and out are
 /// zeros of their sign whatever the mode, rcp(±0) = ±inf, rsq(-0) = -inf,
 /// sqrt(-0) = -0, log(±0) = -inf, invalid operations NaN (measured on
