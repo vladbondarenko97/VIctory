@@ -1995,13 +1995,14 @@ fn perm_matches_the_hardware() {
 fn mad64_matches_the_hardware() {
     let lows = [0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678];
     let highs = [0u32, 1, 0x7FFF_FFFF, 0xFFFF_FFFF, 0x8000_0000];
-    let inputs: Vec<[u32; 4]> = pairs(U32_EDGES, U32_EDGES)
-        .iter()
-        .flat_map(|i| {
-            lows.iter()
-                .flat_map(move |&lo| highs.iter().map(move |&hi| [i[0], i[1], lo, hi]))
-        })
-        .collect();
+    let mut inputs = Vec::new();
+    for i in pairs(U32_EDGES, U32_EDGES) {
+        for lo in lows {
+            for hi in highs {
+                inputs.push([i[0], i[1], lo, hi]);
+            }
+        }
+    }
     // The product to v6:v7, the carry mask to v5.
     let mut unsigned = vop3b(0x176, 6, 106, [v(1), v(2), v(3)], false).to_vec();
     unsigned.extend(vop3(0x101, 5, [int(0), int(1), VCC], NONE));
