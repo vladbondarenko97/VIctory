@@ -2028,7 +2028,7 @@ fn mad64_matches_the_hardware() {
 fn min3_max3_integers_match_the_hardware() {
     let thirds = [0u32, 1, 0xFFFF_FFFF, 0x8000_0000, 0x7FFF_FFFF, 0x1234_5678];
     let abc = triples(U32_EDGES, U32_EDGES, &thirds);
-    let ops: [(u16, fn(u32, u32, u32) -> u32); 4] = [
+    let ops: [(u16, F3); 4] = [
         (0x152, |a, b, c| {
             (a as i32).min(b as i32).min(c as i32) as u32
         }),
