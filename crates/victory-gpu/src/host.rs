@@ -1535,6 +1535,10 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            {
+                let v = crate::shadow::CB_PARTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!("copy back per frame: {:.1} ms (read {:.1}, write {:.1}, watch {:.1}); scanned {:.1} MB, differing {:.1} MB", v[0] / 1e3, v[1] / 1e3, v[2] / 1e3, v[3] / 1e3, v[4] / 1e6, v[5] / 1e6);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

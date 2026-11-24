@@ -188,6 +188,8 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let t_all = std::time::Instant::now();
+        let (mut t_read, mut t_write, mut t_watch, mut scanned, mut dirty) = (0u128, 0u128, 0u128, 0usize, 0usize);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -211,7 +213,13 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                scanned += n;
+                let differs = host != old;
+                if differs { dirty += n; }
+                let tr = std::time::Instant::now();
+                let ok = differs && crate::host::read_into((start + at) as *const u8, title);
+                t_read += tr.elapsed().as_micros();
+                if ok {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -223,8 +231,12 @@ impl Shadow {
                         *h = *t;
                     }
                     if changed {
+                        let tw = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
+                        t_watch += tw.elapsed().as_micros();
+                        let tw = std::time::Instant::now();
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        t_write += tw.elapsed().as_micros();
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -238,7 +250,12 @@ impl Shadow {
             if first < last
                 && !synced.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+                && let Some((now, _)) = {
+                    let tw = std::time::Instant::now();
+                    let r = crate::watch::writes(first * PAGE, last * PAGE, true);
+                    t_watch += tw.elapsed().as_micros();
+                    r
+                }
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -255,6 +272,9 @@ impl Shadow {
             && let Some((_, bytes)) = snapshot.take()
         {
             give_back(bytes);
+        }
+        for (i, v) in [t_all.elapsed().as_micros() as u64, t_read as u64, t_write as u64, t_watch as u64, scanned as u64, dirty as u64].into_iter().enumerate() {
+            CB_PARTS[i].fetch_add(v, Ordering::Relaxed);
         }
         written
     }
@@ -497,3 +517,6 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// Profiling: copy_back total, ReadProcessMemory, WriteProcessMemory, write watch (us); bytes scanned, bytes differing.
+pub(crate) static CB_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
